@@ -53,7 +53,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 API = "https://api.nordvpn.com"
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 WG_PORT = 51820
 
 # Dedicated-IP servers report load 0, so a load sort surfaces them first - but they
@@ -380,9 +380,13 @@ class Worker:
             if len(parts) >= 2:
                 row["http_code"], row["bytes"] = parts[0], parts[1]
 
-            row["ok"] = row["ping_rx"] > 0 or row["http_code"] not in ("", "000")
+            # A tunnel that carries only ICMP is useless as an Xray outbound, and on
+            # these paths that really happens - so a real HTTP response (TCP) is
+            # required, not merely a ping reply.
+            row["ok"] = row["http_code"] not in ("", "000")
             if not row["ok"]:
-                row["note"] = "handshake but no data"
+                row["note"] = ("icmp only, no tcp" if row["ping_rx"] > 0
+                               else "handshake but no data")
         except Exception as e:  # noqa: BLE001 - keep the sweep going
             row["note"] = str(e)[:120]
         return row

@@ -4,7 +4,7 @@ Find and test **NordVPN WireGuard (NordLynx)** servers for a country, so the wor
 used as **PasarGuard / Xray outbounds**. Emits a 3x-ui-compatible `outbounds.json`.
 
 ```
-nordwg 0.0.1
+nordwg 0.0.2
 ```
 
 ## Why this isn't a one-liner
@@ -39,9 +39,11 @@ mechanism the config gets deployed with.
 `--engine wg` — kernel WireGuard via the `wg` CLI inside a per-worker **network namespace** with a
 veth pair standing in for the physical NIC. Needs root, `wireguard-tools` and `iptables`.
 
-Either way, a server only counts as **working** when traffic actually crosses the tunnel — a
-handshake alone is not enough. The tool fetches through the tunnel and records the connect time;
-the box's own routing table, its xray/panel and any live tunnel are never touched.
+Either way, a server only counts as **working** when a real **HTTP response** comes back through the
+tunnel. A handshake is not enough, and neither is a ping reply: on these paths it is common for a
+tunnel to carry ICMP while carrying no TCP at all, which would be useless as an outbound. Servers
+that do that are reported as `icmp only, no tcp`. The box's own routing table, its xray/panel and
+any live tunnel are never touched.
 
 ## Requirements
 
