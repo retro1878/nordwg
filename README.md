@@ -1,117 +1,129 @@
 # nordwg
 
-Find and test **NordVPN WireGuard (NordLynx)** servers for a country, so the working ones can be
-used as **PasarGuard / Xray outbounds**. Emits a 3x-ui-compatible `outbounds.json`.
+[![release](https://img.shields.io/github/v/release/retro1878/nordwg)](https://github.com/retro1878/nordwg/releases)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
+Find NordVPN **WireGuard (NordLynx)** servers that actually work from where you are, and emit each
+one as a ready-to-paste **PasarGuard / Xray / 3x-ui** outbound.
+
+NordVPN advertises hundreds of WireGuard servers per country, but a large fraction are dead,
+entitlement-gated, or reachable only in one direction. `nordwg` finds the subset that genuinely
+carries your traffic and gives you the outbound config for each.
+
+## Install
+
+```bash
+curl -fsSL -O https://raw.githubusercontent.com/retro1878/nordwg/master/install.sh
+chmod +x install.sh
+sudo ./install.sh
 ```
-nordwg 0.0.2
+
+The installer asks for what it needs — your NordVPN access token, an optional HTTP proxy, and a
+default country — then installs `xray-core`, verifies the API is reachable, and puts a `nordwg`
+command on your PATH. Re-run it any time; `--uninstall` removes everything.
+
+Prefer to read before you run:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/retro1878/nordwg/master/install.sh | less
 ```
 
-## Why this isn't a one-liner
+## Quick start
 
-Inside Iran, `api.nordvpn.com` is unusable in two ways at once:
+```bash
+nordwg run --country DE --limit 100      # test 100 lowest-load German servers, write outbounds
+nordwg run --country CA                  # ...or with no --limit, the whole country
+nordwg prove --bundle out/bundle.ca.json --server ca1982
+```
 
-| Layer | What happens | Effect |
-| --- | --- | --- |
-| DNS | poisoned — answers `10.10.34.35`, a bogus private address | any normal client connects to nothing |
-| TLS/SNI | the real Cloudflare edge resets a ClientHello for that name | even `--resolve` to the true IP fails |
+Results and outbounds land in `./out/`.
 
-Every `*.nordvpn.com` hostname is poisoned the same way, so the API is reached **through an HTTP
-proxy** and every endpoint is addressed by the server's **`station` IP** straight from the API —
-no DNS is used anywhere in the test path. On a non-Iranian box the API works directly and no
-proxy is needed.
+## Why this isn't a two-line script
+
+**The API is not always reachable.** On some networks the API host is DNS-poisoned (resolving to a
+bogus private address) and blocked at the TLS layer. Pass `--proxy http://user:pass@host:port` and
+everything works. NordVPN's `*.nordvpn.com` server hostnames are subject to the same treatment, so
+**every endpoint is addressed by the server's `station` IP** taken straight from the API — no DNS is
+used anywhere in the test path.
+
+**The trap is the verdict.** A WireGuard tunnel can complete a handshake, answer pings, and carry
+**no TCP at all** — enough to look perfectly healthy and be useless as an outbound. This is not
+hypothetical; it was the single most common false positive while building this tool. So a server
+counts as working **only when a real HTTP response comes back through the tunnel**. Tunnels that
+carry ICMP but not TCP are reported as `icmp only, no tcp`, so you can see them without being misled.
 
 ## The dedicated-IP trap
 
-NordVPN's dedicated-IP servers report `load 0`, so sorting by load surfaces them first — and on a
-country list that is *most* of the lowest-load servers. They carry a **different WireGuard public
-key** and need a dedicated-IP entitlement on your account. Without it **every handshake silently
-fails**, which looks exactly like network filtering and will send you chasing the wrong problem.
+NordVPN's dedicated-IP servers report `load 0`, so a load sort surfaces them first — often *most* of
+the lowest-load list. They use a **different WireGuard public key** and require a dedicated-IP
+entitlement. Without one, every handshake fails silently, which looks exactly like network
+filtering and will send you hunting for a network problem that isn't there.
 
-They are excluded by default. `--include-dedicated` overrides it.
+They are excluded by default. `--include-dedicated` overrides that.
 
 ## Two test engines
 
-`--engine xray` (default) — starts a real **xray-core** instance with a `wireguard` outbound and a
-socks5 inbound, then fetches through it. No kernel module, no root, no namespace. This is the exact
-mechanism the config gets deployed with.
+`--engine xray` — starts a real **xray-core** instance with a `wireguard` outbound and a socks5
+inbound, and fetches through it. No root, no kernel module, no namespace. This is the same shape as
+the outbound you deploy, so it tests the real thing.
 
 `--engine wg` — kernel WireGuard via the `wg` CLI inside a per-worker **network namespace** with a
-veth pair standing in for the physical NIC. Needs root, `wireguard-tools` and `iptables`.
+veth pair standing in for the physical NIC.
 
-Either way, a server only counts as **working** when a real **HTTP response** comes back through the
-tunnel. A handshake is not enough, and neither is a ping reply: on these paths it is common for a
-tunnel to carry ICMP while carrying no TCP at all, which would be useless as an outbound. Servers
-that do that are reported as `icmp only, no tcp`. The box's own routing table, its xray/panel and
-any live tunnel are never touched.
+The default picks whichever is available: xray-core if it's installed, otherwise kernel `wg`.
 
-## Requirements
-
-- `python3` (stdlib only — no pip)
-- `curl`
-- `xray` binary for the default engine — install with:
-
-```bash
-curl -sSL -o /tmp/x.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-python3 -c "import zipfile; zipfile.ZipFile('/tmp/x.zip').extractall('/tmp/xd')"
-install -m 0755 /tmp/xd/xray /usr/local/bin/xray
-```
-
-- for `--engine wg` only: `apt-get install -y wireguard-tools iptables`
-
-## Setup
-
-```bash
-scp nordwg.py root@<box>:/root/nordwg/nordwg.py
-```
-
-Both secrets are read from the **environment** — never stored by the tool:
-
-```bash
-export NORDWG_PROXY='http://USER:PASS@proxy-host:PORT'   # only needed inside Iran
-export NORDVPN_TOKEN='<64-char NordVPN access token>'    # my.nordaccount.com -> manual setup
-```
+Either way each candidate is isolated. The host's routing table, its existing services and any live
+tunnel are never touched, and everything is torn down afterwards.
 
 ## Usage
 
 ```bash
-# one shot: test the 100 lowest-load German servers, write the outbounds
-python3 nordwg.py run --country DE --limit 100 --concurrency 4
+# fetch the catalog for a country, then test and emit outbounds
+nordwg fetch --country Netherlands --limit 100 --sort load --out out/bundle.nl.json
+nordwg test  --bundle out/bundle.nl.json --concurrency 4 --out out/results.nl.json
+nordwg outbounds --results out/results.nl.json --outdir out
 
-# step by step
-python3 nordwg.py fetch --country Netherlands --limit 100 --sort load --out out/bundle.nl.json
-python3 nordwg.py test  --bundle out/bundle.nl.json --concurrency 4 --out out/results.nl.json
-python3 nordwg.py outbounds --results out/results.nl.json --outdir out
+# or all three in one go
+nordwg run --country NL --limit 100
 ```
+
+`--country` takes a name (`Germany`), a code (`DE`), or an unambiguous prefix. With `NORDWG_COUNTRY`
+set it can be omitted.
+
+| Flag | Meaning |
+| --- | --- |
+| `--limit N` | test at most N servers (default: all) |
+| `--sort load\|name\|random` | which servers to prefer (`load` = least busy first) |
+| `--concurrency N` | parallel tests (default 4; keep it low on small hosts) |
+| `--repeat N` | test each server N times — it must pass **every** time |
+| `--timeout S` | seconds to wait for a handshake (default 6) |
+| `--engine xray\|wg` | test engine (default: whichever is installed) |
+| `--top N` | emit outbounds for the best N only |
+| `--include-dedicated` | also test dedicated-IP servers |
+
+`--repeat` is worth using before you deploy anything. These paths are flaky — a server that works
+now may not in ten minutes — and a single pass is a weak signal.
 
 ### Proving one server
 
-`test` tells you a server carries traffic at all; `prove` shows you where it comes out, by
-bringing the tunnel up and asking Cloudflare to echo the client address back through it:
+`test` tells you a server carries traffic; `prove` shows you **where it comes out**, by bringing the
+tunnel up and asking Cloudflare to echo the client address back through it:
 
-```bash
-python3 nordwg.py prove --bundle out/bundle.ca.json --server ca1982
-```
-
-```
+```console
+$ nordwg prove --bundle out/bundle.ca.json --server ca1982
 server   : ca1982.nordvpn.com
 station  : 187.15.140.15:51820
-engine   : xray
-handshake: (xray brings the tunnel up on first traffic)
+engine   : wg
+handshake: 258 ms
+ping     : 4 packets transmitted, 4 received, 0% packet loss, time 3004ms
 http     : 301 bytes=167
-exit ip  : ip=187.15.140.107
-           colo=YYZ
-           loc=CA
+exit ip  : ip=187.15.140.112
+         : colo=YYZ
+         : loc=CA
 geo      : success / Canada / Toronto / Datacamp Limited
 ```
 
-If `http` comes back `000 bytes=0` while `handshake` succeeds, the tunnel is carrying ICMP only —
-it will connect and then die as an outbound. That is the failure mode `test` reports as
-`icmp only, no tcp`.
-
-`--country` takes a name (`Germany`), a code (`DE`), or an unambiguous prefix.
-Other flags: `--sort load|name|random`, `--timeout 6`, `--address 10.5.0.2/32`, `--port 51820`,
-`--engine xray|wg`, `--xray PATH`, `--top N`, `--mtu 1420`, `--include-dedicated`.
+Exit IPs are printed in full so you can confirm the endpoint really is where you expect.
 
 ## Output
 
@@ -120,21 +132,22 @@ Other flags: `--sort load|name|random`, `--timeout 6`, `--address 10.5.0.2/32`, 
 | `results.<cc>.json` / `.csv` | every tested server, ranked: connect time, HTTP code, verdict |
 | `results.<cc>-working.txt` | the working hostnames only |
 | `outbounds.json` | a **3x-ui-compatible** array of WireGuard outbounds |
-| `conf/<hostname>.conf` | plain `wg-quick` config per working server |
+| `conf/<hostname>.conf` | a plain `wg-quick` config per working server |
 
-The outbound matches the shape 3x-ui (MHSanaei) generates:
+The outbound matches the shape 3x-ui (MHSanaei) generates, so it drops straight into an Xray or
+PasarGuard core:
 
 ```json
 {
-  "tag": "nord-de1606-nordvpn-com",
+  "tag": "nord-ca1982-nordvpn-com",
   "protocol": "wireguard",
   "settings": {
-    "secretKey": "<account NordLynx private key>",
+    "secretKey": "<your NordLynx private key>",
     "address": ["10.5.0.2/32"],
     "peers": [
       {
         "publicKey": "<server public key>",
-        "endpoint": "195.181.170.195:51820",
+        "endpoint": "187.15.140.15:51820",
         "allowedIPs": ["0.0.0.0/0", "::/0"],
         "keepAlive": 25
       }
@@ -144,24 +157,42 @@ The outbound matches the shape 3x-ui (MHSanaei) generates:
 }
 ```
 
-## Findings
+## What we learned
 
-Measured 2026-10-01, same credential and the same 20 German servers from two vantage points:
+Things worth knowing before you trust a result, from building and running this:
 
-| Vantage | Result |
-| --- | --- |
-| Germany | **9/20 working** (38–90 ms) |
-| Iran | **0/20** |
+- **Yield varies enormously by country and by vantage point.** One country gave ~45% usable servers
+  on a small sample; another gave **1.2%**. Sweeping a whole country is often the only way to find
+  the handful that work — and those tend to cluster in one or two of the provider's address blocks.
+- **A big majority of a country's servers may not answer at all** — commonly 85–95%, with no
+  handshake and no reply. That is the servers, not your setup.
+- **The working set moves.** Endpoints that passed an hour ago can stop passing. Re-run before
+  deploying, and use `--repeat` to keep only the stable ones.
+- **Handshakes lie.** See `icmp only, no tcp` above — the whole reason the criterion is an HTTP
+  response.
 
-Verifying a 20 s timeout gave 8/20 rather than 9/20, so the failures are genuinely dead servers.
-From the Iranian box, `tcpdump` on the WAN shows valid 148-byte handshake initiations leaving with
-**zero replies**, while UDP itself is not blocked (DNS to 8.8.8.8/1.1.1.1 works). Conclusion:
-**direct NordVPN WireGuard does not get through from an Iranian box** — the WireGuard outbound has
-to terminate on a foreign host.
+## Contributing
+
+Ideas that would be genuinely useful, if you want to take one:
+
+- **Stability scoring** — run the same server across a day and keep the ones that never flap.
+- **Multi-country sweeps** — `--countries DE,NL,CA` into a single ranked output.
+- **Rotation** — emit a set of equally-good outbounds plus a routing rule that fails over between
+  them, instead of one endpoint that dies silently.
+- **Scheduled refresh** — a systemd timer that re-tests and rewrites `outbounds.json`.
+- **Other providers** — the catalog and peer-key extraction are the only provider-specific parts.
+
+Issues and PRs welcome. Keep the code dependency-free (Python standard library only) — it has to
+run on a plain VPS with nothing installed.
 
 ## Notes
 
 - One NordLynx private key works across **all** servers; there is no per-device registration.
-- The country catalog is public; only the private-key fetch needs a token.
-- Keep concurrency modest (2–4) on small Iranian boxes — little RAM, often no swap.
-- Results are a snapshot. Filtering changes hour to hour — re-run before trusting an old result.
+  The country catalog is public — only fetching your private key needs a token.
+- Concurrency defaults low because the target is usually a small VPS. Raise it on beefier hosts.
+- `nordwg` only ever talks to `api.nordvpn.com` and the servers it is testing. It does not touch
+  your existing configuration.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

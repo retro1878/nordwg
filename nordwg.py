@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-nordwg - find and test NordVPN WireGuard (NordLynx) servers from an Iranian box.
+nordwg - find and test NordVPN WireGuard (NordLynx) servers.
+
+NordVPN publishes hundreds of WireGuard servers per country, but a large fraction of
+them are dead, entitlement-gated, or reachable only in one direction. This tool finds
+the subset that genuinely carries traffic from where you are, and emits each one as a
+PasarGuard / Xray / 3x-ui outbound.
 
 Why this is not a two-line curl script
 --------------------------------------
-From inside Iran, api.nordvpn.com is poisoned at the DNS layer (it answers
-10.10.34.35, a bogus private address) and the real Cloudflare edge is SNI-blocked,
-so the API has to go out through an HTTP proxy. The NordVPN server hostnames
-(*.nordvpn.com) are poisoned the same way, so every endpoint is addressed by its
-`station` IP straight from the API - no DNS is used anywhere in the test path.
+On a filtered network the API host can be poisoned at the DNS layer and blocked at the
+TLS layer, so it is reached through an HTTP proxy (--proxy), and every endpoint is
+addressed by the server's `station` IP straight from the API - no DNS is used anywhere
+in the test path.
 
-Each candidate is brought up inside its own network namespace with a veth pair
-standing in for the physical NIC, so the box's own routing table, its xray/panel
-and any live tunnel are never touched. The handshake is done with the native `wg`
-CLI; a server only counts as working if traffic actually crosses the tunnel.
+The trap is the verdict. A WireGuard tunnel can complete a handshake and carry ICMP
+while carrying no TCP at all - enough to look healthy, and useless as an outbound. A
+server only counts here when a real HTTP response comes back through the tunnel;
+ICMP-only tunnels are reported as `icmp only, no tcp`.
 
 Subcommands
 -----------
@@ -55,7 +59,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 API = "https://api.nordvpn.com"
-__version__ = "0.0.3"
+__version__ = "0.1.0"
 WG_PORT = 51820
 
 # Dedicated-IP servers report load 0, so a load sort surfaces them first - but they
@@ -86,13 +90,20 @@ def resolve_engine(args):
     return "wg"
 
 
+def country_arg(args):
+    c = getattr(args, "country", None) or os.environ.get("NORDWG_COUNTRY")
+    if not c:
+        die("no country given - pass --country, or set NORDWG_COUNTRY")
+    return c
+
+
 def die(msg, code=1):
     print("error: " + msg, file=sys.stderr, flush=True)
     sys.exit(code)
 
 
 # --------------------------------------------------------------------------
-# HTTP (through the proxy, because the domain is poisoned in Iran)
+# HTTP (via --proxy, for networks where the API host is DNS-poisoned or blocked)
 # --------------------------------------------------------------------------
 
 def api_get(path, token=None, proxy=None, timeout=30):
@@ -199,7 +210,7 @@ def list_servers(country_id, proxy, include_dedicated=False):
 
 def cmd_fetch(args):
     proxy = args.proxy
-    country = resolve_country(args.country, proxy)
+    country = resolve_country(country_arg(args), proxy)
     log("country: %s (%s), %d servers advertised"
         % (country["name"], country["code"], country.get("serverCount", 0)))
     servers = list_servers(country["id"], proxy,
@@ -711,6 +722,29 @@ def cmd_prove(args):
 # Test
 # --------------------------------------------------------------------------
 
+def attempt(worker, server, repeat):
+    """Test a server up to `repeat` times; it must pass every time to count.
+
+    These paths are flaky - a server that works now may not in ten minutes - so a
+    single pass is a weak signal. A failure short-circuits, which also makes the
+    (many) dead servers cheap.
+    """
+    repeat = max(1, repeat)
+    row = None
+    passes = 0
+    for _ in range(repeat):
+        row = worker.test(server)
+        if not row["ok"]:
+            break
+        passes += 1
+    row["repeat"] = repeat
+    row["repeat_ok"] = passes
+    row["ok"] = passes == repeat
+    if not row["ok"] and passes:
+        row["note"] = "%d/%d passes" % (passes, repeat)
+    return row
+
+
 def cmd_test(args):
     engine = resolve_engine(args)
     if engine == "wg":
@@ -738,6 +772,7 @@ def cmd_test(args):
         servers = servers[:args.limit]
 
     conc = max(1, min(args.concurrency, min(len(servers) or 1, 200)))
+    repeat = max(1, getattr(args, "repeat", 1))
     outdir = os.path.dirname(os.path.abspath(args.out))
     if engine == "wg":
         keyfile = "/run/nordwg.key"
@@ -776,7 +811,7 @@ def cmd_test(args):
             for w in workers:
                 if idx >= len(queue):
                     break
-                futures[pool.submit(w.test, queue[idx])] = w
+                futures[pool.submit(attempt, w, queue[idx], repeat)] = w
                 idx += 1
             while futures:
                 for fut in as_completed(list(futures)):
@@ -791,7 +826,7 @@ def cmd_test(args):
                            row["loss_pct"], row["http_code"] or "-",
                            row["note"]))
                     if not stop["flag"] and idx < len(queue):
-                        futures[pool.submit(w.test, queue[idx])] = w
+                        futures[pool.submit(attempt, w, queue[idx], repeat)] = w
                         idx += 1
                     break
     finally:
@@ -873,6 +908,7 @@ def cmd_outbounds(args):
 
 
 def cmd_run(args):
+    args.country = country_arg(args)
     ns = argparse.Namespace(**vars(args))
     ns.out = os.path.join(args.outdir, "bundle.%s.json" % args.country.lower())
     ns.sort = args.sort
@@ -911,8 +947,8 @@ def read_json(path):
 
 
 COLUMNS = ["ok", "hostname", "station", "endpoint", "city", "country", "load",
-           "handshake_ok", "handshake_ms", "loss_pct", "rtt_min", "rtt_avg",
-           "rtt_max", "http_code", "bytes", "note"]
+           "repeat_ok", "repeat", "handshake_ok", "handshake_ms", "loss_pct",
+           "rtt_min", "rtt_avg", "rtt_max", "http_code", "bytes", "note"]
 
 
 def write_csv(path, rows):
@@ -938,7 +974,8 @@ def write_working(path, rows):
 def build_parser():
     p = argparse.ArgumentParser(
         prog="nordwg",
-        description="Find and test NordVPN WireGuard servers from an Iranian box.")
+        description="Find and test NordVPN WireGuard servers, and emit working "
+                    "PasarGuard / Xray outbounds.")
     p.add_argument("--version", action="version", version="nordwg " + __version__)
     p.add_argument("--proxy", default=os.environ.get("NORDWG_PROXY"),
                    help="HTTP proxy for the NordVPN API (default: $NORDWG_PROXY)")
@@ -947,7 +984,7 @@ def build_parser():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     f = sub.add_parser("fetch", help="build bundle.json")
-    f.add_argument("--country", required=True)
+    f.add_argument("--country", help="name, code, or prefix (default: $NORDWG_COUNTRY)")
     f.add_argument("--limit", type=int, default=0)
     f.add_argument("--sort", choices=["load", "name", "random"], default="load")
     f.add_argument("--include-dedicated", action="store_true",
@@ -967,6 +1004,8 @@ def build_parser():
                    help="xray: run real xray-core (default). wg: kernel netns + wg.")
     t.add_argument("--xray", help="path to the xray binary (engine=xray)")
     t.add_argument("--mtu", type=int, default=1420)
+    t.add_argument("--repeat", type=int, default=1,
+                   help="test each server N times; it must pass every time (stability)")
     t.set_defaults(func=cmd_test)
 
     v = sub.add_parser("prove", help="prove one server carries real traffic, and show the exit IP")
@@ -988,7 +1027,7 @@ def build_parser():
     o.set_defaults(func=cmd_outbounds)
 
     r = sub.add_parser("run", help="fetch + test + outbounds")
-    r.add_argument("--country", required=True)
+    r.add_argument("--country", help="name, code, or prefix (default: $NORDWG_COUNTRY)")
     r.add_argument("--limit", type=int, default=100)
     r.add_argument("--sort", choices=["load", "name", "random"], default="load")
     r.add_argument("--include-dedicated", action="store_true",
@@ -999,6 +1038,8 @@ def build_parser():
     r.add_argument("--port", type=int, default=WG_PORT)
     r.add_argument("--engine", choices=["xray", "wg"], default=None)
     r.add_argument("--xray", help="path to the xray binary")
+    r.add_argument("--repeat", type=int, default=1,
+                   help="test each server N times; it must pass every time (stability)")
     r.add_argument("--mtu", type=int, default=1420)
     r.add_argument("--top", type=int, default=0)
     r.add_argument("--outdir", default="out")
