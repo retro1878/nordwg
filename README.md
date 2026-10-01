@@ -84,6 +84,31 @@ python3 nordwg.py test  --bundle out/bundle.nl.json --concurrency 4 --out out/re
 python3 nordwg.py outbounds --results out/results.nl.json --outdir out
 ```
 
+### Proving one server
+
+`test` tells you a server carries traffic at all; `prove` shows you where it comes out, by
+bringing the tunnel up and asking Cloudflare to echo the client address back through it:
+
+```bash
+python3 nordwg.py prove --bundle out/bundle.ca.json --server ca1982
+```
+
+```
+server   : ca1982.nordvpn.com
+station  : 187.15.140.15:51820
+engine   : xray
+handshake: (xray brings the tunnel up on first traffic)
+http     : 301 bytes=167
+exit ip  : ip=187.15.140.107
+           colo=YYZ
+           loc=CA
+geo      : success / Canada / Toronto / Datacamp Limited
+```
+
+If `http` comes back `000 bytes=0` while `handshake` succeeds, the tunnel is carrying ICMP only —
+it will connect and then die as an outbound. That is the failure mode `test` reports as
+`icmp only, no tcp`.
+
 `--country` takes a name (`Germany`), a code (`DE`), or an unambiguous prefix.
 Other flags: `--sort load|name|random`, `--timeout 6`, `--address 10.5.0.2/32`, `--port 51820`,
 `--engine xray|wg`, `--xray PATH`, `--top N`, `--mtu 1420`, `--include-dedicated`.

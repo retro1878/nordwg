@@ -20,6 +20,7 @@ Subcommands
 -----------
   fetch      Build a bundle.json (server catalog for a country + your WG key)
   test       Test every server in a bundle.json on this box
+  prove      Bring up one server and show the real exit IP it gives you
   outbounds  Turn results.json into PasarGuard/Xray WireGuard outbounds + .conf files
   run        fetch + test + outbounds in one go
 
@@ -47,13 +48,14 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 API = "https://api.nordvpn.com"
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 WG_PORT = 51820
 
 # Dedicated-IP servers report load 0, so a load sort surfaces them first - but they
@@ -72,6 +74,16 @@ _color = sys.stdout.isatty()
 
 def log(msg):
     print(msg, flush=True)
+
+
+def resolve_engine(args):
+    """Use whatever is actually available: xray if installed, otherwise kernel wg."""
+    eng = getattr(args, "engine", None)
+    if eng:
+        return eng
+    if getattr(args, "xray", None) or shutil.which("xray"):
+        return "xray"
+    return "wg"
 
 
 def die(msg, code=1):
@@ -392,6 +404,31 @@ class Worker:
         return row
 
 
+def xray_config(server, key, address, port, mtu, socks_port):
+    """The Xray outbound this tool tests is the same shape it emits for PasarGuard."""
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "socks", "listen": "127.0.0.1", "port": socks_port,
+            "protocol": "socks", "settings": {"udp": True},
+        }],
+        "outbounds": [{
+            "tag": "wg", "protocol": "wireguard",
+            "settings": {
+                "secretKey": key,
+                "address": [address],
+                "peers": [{
+                    "publicKey": server["public_key"],
+                    "endpoint": "%s:%d" % (server["station"], port),
+                    "allowedIPs": ["0.0.0.0/0", "::/0"],
+                    "keepAlive": 25,
+                }],
+                "mtu": mtu,
+            },
+        }],
+    }
+
+
 class XrayWorker:
     """Tests a server by running a real Xray-core instance with a wireguard outbound.
 
@@ -421,27 +458,7 @@ class XrayWorker:
         shutil.rmtree(self.dir, ignore_errors=True)
 
     def _config(self, server):
-        return {
-            "log": {"loglevel": "warning"},
-            "inbounds": [{
-                "tag": "socks", "listen": "127.0.0.1", "port": self.socks,
-                "protocol": "socks", "settings": {"udp": True},
-            }],
-            "outbounds": [{
-                "tag": "wg", "protocol": "wireguard",
-                "settings": {
-                    "secretKey": self.key,
-                    "address": [self.address],
-                    "peers": [{
-                        "publicKey": server["public_key"],
-                        "endpoint": "%s:%d" % (server["station"], self.port),
-                        "allowedIPs": ["0.0.0.0/0", "::/0"],
-                        "keepAlive": 25,
-                    }],
-                    "mtu": self.mtu,
-                },
-            }],
-        }
+        return xray_config(server, self.key, self.address, self.port, self.mtu, self.socks)
 
     def _wait_socks(self, deadline):
         while time.time() < deadline:
@@ -517,11 +534,185 @@ class XrayWorker:
 
 
 # --------------------------------------------------------------------------
+# Prove
+# --------------------------------------------------------------------------
+
+def _probes(runner):
+    """Fetch through the tunnel and report what the far end says we look like."""
+    r = runner(["curl", "-sk", "-o", "/dev/null",
+                "-w", "%{http_code} bytes=%{size_download}",
+                "--max-time", "20", "http://1.1.1.1/"])
+    out = r.stdout.strip()
+    log("http     : %s" % (out or "(no answer - no TCP through the tunnel)"))
+
+    r = runner(["curl", "-sk", "--max-time", "20", "https://1.1.1.1/cdn-cgi/trace"])
+    seen = False
+    for line in r.stdout.splitlines():
+        if line.startswith(("ip=", "loc=", "colo=")):
+            log("%-9s: %s" % ("exit ip" if line.startswith("ip=") else "", line))
+            seen = True
+    if not seen:
+        log("exit ip  : (no answer)")
+
+    r = runner(["curl", "-s", "--max-time", "20",
+                "http://ip-api.com/line/?fields=status,country,city,isp"])
+    geo = r.stdout.replace("\n", " / ").strip()
+    log("geo      : %s" % (geo if geo else "(no answer)"))
+
+
+def _prove_wg(args, srv, keyfile):
+    if os.geteuid() != 0:
+        die("the wg engine must run as root (netns + wireguard-tools)")
+    for tool in ("wg", "ip", "iptables"):
+        if not shutil.which(tool):
+            die("missing %r" % tool)
+
+    ns, hv, nv = "nordprove", "npvh", "npvv"
+    host_ip, ns_ip = "10.205.9.1", "10.205.9.2"
+    ep = srv["station"]
+
+    def clean():
+        for c in (["ip", "netns", "del", ns], ["ip", "link", "del", hv],
+                  ["iptables", "-D", "FORWARD", "-i", hv, "-j", "ACCEPT"],
+                  ["iptables", "-D", "FORWARD", "-o", hv, "-j", "ACCEPT"],
+                  ["iptables", "-t", "nat", "-D", "POSTROUTING",
+                   "-s", "10.205.9.0/24", "-j", "MASQUERADE"]):
+            sh(c)
+        d = "/etc/netns/%s" % ns
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                os.remove(os.path.join(d, f))
+            os.rmdir(d)
+
+    clean()
+    os.makedirs("/etc/netns/%s" % ns, exist_ok=True)
+    with open("/etc/netns/%s/resolv.conf" % ns, "w") as fh:
+        fh.write("nameserver 1.1.1.1\n")
+    sh(["ip", "netns", "add", ns])
+    sh(["ip", "link", "add", hv, "type", "veth", "peer", "name", nv])
+    sh(["ip", "link", "set", nv, "netns", ns])
+    sh(["ip", "addr", "add", host_ip + "/24", "dev", hv])
+    sh(["ip", "link", "set", hv, "up"])
+    sh(["ip", "netns", "exec", ns, "ip", "link", "set", "lo", "up"])
+    sh(["ip", "netns", "exec", ns, "ip", "addr", "add", ns_ip + "/24", "dev", nv])
+    sh(["ip", "netns", "exec", ns, "ip", "link", "set", nv, "up"])
+    sh(["ip", "netns", "exec", ns, "ip", "route", "add", "default", "via", host_ip])
+    sh(["iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "10.205.9.0/24", "-j", "MASQUERADE"])
+    sh(["iptables", "-I", "FORWARD", "1", "-i", hv, "-j", "ACCEPT"])
+    sh(["iptables", "-I", "FORWARD", "1", "-o", hv, "-j", "ACCEPT"])
+    try:
+        sh(["ip", "netns", "exec", ns, "ip", "link", "add", "wg0", "type", "wireguard"],
+           check=True)
+        sh(["ip", "netns", "exec", ns, "wg", "set", "wg0", "private-key", keyfile,
+            "peer", srv["public_key"], "endpoint", "%s:%d" % (ep, args.port),
+            "allowed-ips", "0.0.0.0/0", "persistent-keepalive", "25"])
+        sh(["ip", "netns", "exec", ns, "ip", "addr", "add", args.address, "dev", "wg0"])
+        sh(["ip", "netns", "exec", ns, "ip", "route", "replace", ep + "/32",
+            "via", host_ip, "dev", nv])
+        sh(["ip", "netns", "exec", ns, "ip", "link", "set", "wg0", "up"])
+        sh(["ip", "netns", "exec", ns, "ip", "route", "replace", "default", "dev", "wg0"])
+
+        t0, ms = time.time(), 0
+        while time.time() < t0 + args.timeout:
+            out = sh(["ip", "netns", "exec", ns, "wg", "show", "wg0",
+                      "latest-handshakes"]).stdout
+            for line in out.splitlines():
+                parts = line.split()
+                if parts and parts[-1].isdigit() and parts[-1] != "0":
+                    ms = int((time.time() - t0) * 1000)
+                    break
+            if ms:
+                break
+            time.sleep(0.25)
+        log("handshake: %s" % ("%d ms" % ms if ms else "FAILED - no reply from the server"))
+        if not ms:
+            return
+        ping = sh(["ip", "netns", "exec", ns, "ping", "-c", "4", "-W", "2", "1.1.1.1"],
+                  timeout=20).stdout
+        for line in ping.splitlines():
+            if "packet loss" in line:
+                log("ping     : %s" % line.strip())
+        _probes(lambda argv, t=30: sh(["ip", "netns", "exec", ns] + argv, timeout=t))
+    finally:
+        clean()
+
+
+def _prove_xray(args, srv, keyfile):
+    binary = getattr(args, "xray", None) or shutil.which("xray")
+    if not binary or not os.path.exists(binary):
+        die("xray binary not found - pass --xray PATH")
+    key = open(keyfile).read().strip()
+    work = tempfile.mkdtemp(prefix="nordwg-prove-")
+    cfg = os.path.join(work, "config.json")
+    socks = 20999
+    with open(cfg, "w") as fh:
+        json.dump(xray_config(srv, key, args.address, args.port,
+                              getattr(args, "mtu", 1420), socks), fh)
+    err = open(os.path.join(work, "xray.err"), "wb")
+    proc = subprocess.Popen([binary, "run", "-c", cfg],
+                            stdout=subprocess.DEVNULL, stderr=err)
+    try:
+        deadline = time.time() + 6
+        ready = False
+        while time.time() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", socks), 0.3):
+                    ready = True
+                    break
+            except OSError:
+                time.sleep(0.05)
+        if not ready:
+            die("xray did not start (see %s)" % os.path.join(work, "xray.err"))
+        log("handshake: (xray brings the tunnel up on first traffic)")
+        _probes(lambda argv, t=30: sh(argv[:1] + ["--socks5-hostname",
+                                                  "127.0.0.1:%d" % socks] + argv[1:],
+                                      timeout=t))
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def cmd_prove(args):
+    engine = resolve_engine(args)
+    bundle = read_json(args.bundle)
+    key = bundle.get("private_key")
+    if not key:
+        die("bundle has no private_key - re-run `fetch` with a valid access token")
+    want = args.server.rstrip(".")
+    cands = [s for s in bundle["servers"]
+             if s["hostname"].split(".")[0] == want or s["hostname"].startswith(want)]
+    if not cands:
+        die("no server matching %r in %s" % (args.server, args.bundle))
+    srv = cands[0]
+    log("server   : %s" % srv["hostname"])
+    log("station  : %s:%d" % (srv["station"], args.port))
+    log("engine   : %s" % engine)
+    keyfile = "/run/nordwg-prove.key"
+    with open(keyfile, "w") as fh:
+        fh.write(key + "\n")
+    os.chmod(keyfile, 0o600)
+    try:
+        if engine == "wg":
+            _prove_wg(args, srv, keyfile)
+        else:
+            _prove_xray(args, srv, keyfile)
+    finally:
+        if os.path.exists(keyfile):
+            os.remove(keyfile)
+    return 0
+
+
+# --------------------------------------------------------------------------
 # Test
 # --------------------------------------------------------------------------
 
 def cmd_test(args):
-    engine = getattr(args, "engine", "xray")
+    engine = resolve_engine(args)
     if engine == "wg":
         if os.geteuid() != 0:
             die("the wg engine must run as root (netns + wireguard-tools)")
@@ -772,11 +963,22 @@ def build_parser():
     t.add_argument("--timeout", type=float, default=6.0)
     t.add_argument("--address", default=DEFAULT_ADDRESS)
     t.add_argument("--port", type=int, default=WG_PORT)
-    t.add_argument("--engine", choices=["xray", "wg"], default="xray",
+    t.add_argument("--engine", choices=["xray", "wg"], default=None,
                    help="xray: run real xray-core (default). wg: kernel netns + wg.")
     t.add_argument("--xray", help="path to the xray binary (engine=xray)")
     t.add_argument("--mtu", type=int, default=1420)
     t.set_defaults(func=cmd_test)
+
+    v = sub.add_parser("prove", help="prove one server carries real traffic, and show the exit IP")
+    v.add_argument("--bundle", required=True)
+    v.add_argument("--server", required=True, help="hostname or prefix, e.g. ca1982")
+    v.add_argument("--engine", choices=["xray", "wg"], default=None)
+    v.add_argument("--xray", help="path to the xray binary (engine=xray)")
+    v.add_argument("--timeout", type=float, default=12.0)
+    v.add_argument("--address", default=DEFAULT_ADDRESS)
+    v.add_argument("--port", type=int, default=WG_PORT)
+    v.add_argument("--mtu", type=int, default=1420)
+    v.set_defaults(func=cmd_prove)
 
     o = sub.add_parser("outbounds", help="emit PasarGuard/Xray outbounds")
     o.add_argument("--results", required=True)
@@ -795,7 +997,7 @@ def build_parser():
     r.add_argument("--timeout", type=float, default=6.0)
     r.add_argument("--address", default=DEFAULT_ADDRESS)
     r.add_argument("--port", type=int, default=WG_PORT)
-    r.add_argument("--engine", choices=["xray", "wg"], default="xray")
+    r.add_argument("--engine", choices=["xray", "wg"], default=None)
     r.add_argument("--xray", help="path to the xray binary")
     r.add_argument("--mtu", type=int, default=1420)
     r.add_argument("--top", type=int, default=0)
