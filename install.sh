@@ -21,6 +21,8 @@ ASSUME_YES=0
 WANT_XRAY=1
 WANT_WG=1
 UNINSTALL=0
+PURGE=0
+INSTALLED=""
 TOKEN="${NORDVPN_TOKEN:-}"
 PROXY="${NORDWG_PROXY:-}"
 COUNTRY="${NORDWG_COUNTRY:-}"
@@ -47,7 +49,8 @@ Options:
   --no-xray          Skip installing xray-core (use the kernel wg engine instead)
   --no-wg            Skip installing wireguard-tools + iptables
   -y, --yes          Don't prompt for confirmation
-  --uninstall        Remove nordwg, keeping nothing behind
+  --uninstall        Remove nordwg: its files, secrets and every runtime trace
+  --purge            With --uninstall, also remove packages this installer added
   -h, --help         This text
 EOF
 }
@@ -61,20 +64,13 @@ while [ $# -gt 0 ]; do
     --no-wg)     WANT_WG=0; shift ;;
     -y|--yes)    ASSUME_YES=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
+    --purge)     PURGE=1; shift ;;
     -h|--help)   usage; exit 0 ;;
     *)           die "unknown option: $1 (try --help)" ;;
   esac
 done
 
 [ "$(id -u)" = "0" ] || die "run as root, or: sudo $0"
-
-# ---------------------------------------------------------------- uninstall
-if [ "$UNINSTALL" = 1 ]; then
-  rm -f "$BINDIR/nordwg"
-  rm -rf "$PREFIX"
-  ok "removed $PREFIX and $BINDIR/nordwg (xray/wireguard-tools left in place)"
-  exit 0
-fi
 
 # ---------------------------------------------------------------- platform
 ARCH="$(uname -m)"
@@ -103,6 +99,91 @@ pkg_install() {
   esac
 }
 
+pkg_remove() {
+  [ -n "$PKG" ] || return 0
+  case "$PKG" in
+    apt) DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq "$@" ;;
+    dnf) dnf remove -y -q "$@" ;;
+    yum) yum remove -y -q "$@" ;;
+    apk) apk del "$@" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- uninstall
+#
+# Leaves no trace: the files, the token, and everything a test can leave behind
+# when it is killed mid-run (namespaces, veth pairs, firewall rules, key files,
+# worker scratch). Packages are only removed with --purge, because xray and
+# wireguard-tools are often used by other software on the same host.
+if [ "$UNINSTALL" = 1 ]; then
+  printf '%s\n' "${B}nordwg uninstall${N}"
+
+  installed=""
+  if [ -r "$PREFIX/.installed" ]; then
+    installed="$(cat "$PREFIX/.installed")"
+  fi
+
+  for ns in $(ip netns list 2>/dev/null | awk '{print $1}'); do
+    case "$ns" in
+      nordwg*|nordproof)
+        info "removing namespace $ns"
+        ip netns del "$ns" 2>/dev/null || true ;;
+    esac
+  done
+
+  for link in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1); do
+    case "$link" in
+      nwh[0-9]*|nwv[0-9]*|npvh|npvv)
+        info "removing link $link"
+        ip link del "$link" 2>/dev/null || true ;;
+    esac
+  done
+
+  while IFS= read -r spec; do
+    [ -n "$spec" ] && iptables ${spec/-A FORWARD/-D FORWARD} 2>/dev/null || true
+  done <<< "$(iptables -S FORWARD 2>/dev/null | grep -E -- '-(i|o) (nwh[0-9]+|nwv[0-9]+|npvh|npvv)' || true)"
+
+  while IFS= read -r spec; do
+    [ -n "$spec" ] && iptables -t nat ${spec/-A POSTROUTING/-D POSTROUTING} 2>/dev/null || true
+  done <<< "$(iptables -t nat -S POSTROUTING 2>/dev/null | grep -E '10\.20[1345]\.' || true)"
+
+  rm -rf /etc/netns/nordproof /etc/netns/nordwg* 2>/dev/null || true
+  rm -f  /run/nordwg.key /run/nordwg-prove.key 2>/dev/null || true
+  rm -rf /tmp/nordwg-* /tmp/nordwg-check.json 2>/dev/null || true
+
+  rm -f  "$BINDIR/nordwg"
+  rm -rf "$PREFIX"
+  ok "removed $PREFIX, $BINDIR/nordwg, the token, and all runtime traces"
+
+  if [ "$PURGE" = 1 ] && [ -n "$installed" ]; then
+    case " $installed " in
+      *" xray "*) rm -f "$BINDIR/xray" && info "removed $BINDIR/xray" ;;
+    esac
+    pkgs="$(printf '%s\n' $installed | grep -vx xray | tr '\n' ' ')"
+    if [ -n "${pkgs// /}" ]; then
+      info "removing packages this installer added:$pkgs"
+      pkg_remove $pkgs || warn "some packages could not be removed"
+    fi
+    ok "purged"
+  elif [ -n "$installed" ]; then
+    warn "left installed:$installed"
+    info "other software may need them; remove them too with:"
+    info "  $0 --uninstall --purge"
+  fi
+
+  left="$(find /root /home /opt /srv /tmp -maxdepth 3 \
+            \( -name 'results.*.json' -o -name 'bundle.*.json' \
+               -o -name 'outbounds.json' -o -name '.nordwg-workers' \) 2>/dev/null | head -8)"
+  if [ -n "$left" ]; then
+    echo
+    warn "these still contain your NordLynx private key or a server config:"
+    printf '%s\n' "$left" | sed 's/^/    /'
+    info "delete them by hand if you want no trace at all - they are your output,"
+    info "so this script will not guess which ones you meant to keep."
+  fi
+  exit 0
+fi
+
 printf '%s\n' "${B}nordwg installer${N}"
 info "host    : $(hostname 2>/dev/null || echo '?')  ($(uname -srm))"
 info "install : $PREFIX   (command: $BINDIR/nordwg)"
@@ -125,6 +206,7 @@ if [ "$WANT_XRAY" = 1 ] && ! command -v xray >/dev/null 2>&1; then
       python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" \
         "$tmp/xray.zip" "$tmp/x" 2>/dev/null || die "could not unpack xray-core"
       install -m 0755 "$tmp/x/xray" "$BINDIR/xray"
+      INSTALLED="$INSTALLED xray"
       ok "xray-core $("$BINDIR/xray" version 2>/dev/null | head -n1)"
     else
       warn "could not download xray-core - you can still use --engine wg"
@@ -134,15 +216,20 @@ if [ "$WANT_XRAY" = 1 ] && ! command -v xray >/dev/null 2>&1; then
   fi
 fi
 
-if [ "$WANT_WG" = 1 ] && { ! command -v wg >/dev/null 2>&1 || ! command -v iptables >/dev/null 2>&1; }; then
-  if [ "$ASSUME_YES" = 1 ]; then
-    pkg_install wireguard-tools iptables && ok "kernel wg engine available"
-  else
-    read -rp "Install wireguard-tools + iptables for the kernel engine? [y/N] " a
-    case "$a" in
-      [yY]*) pkg_install wireguard-tools iptables && ok "kernel wg engine available" ;;
-      *)     warn "skipped - the wg engine will be unavailable" ;;
-    esac
+if [ "$WANT_WG" = 1 ]; then
+  wgpkg=""
+  if ! command -v wg >/dev/null 2>&1; then wgpkg="$wgpkg wireguard-tools"; fi
+  if ! command -v iptables >/dev/null 2>&1; then wgpkg="$wgpkg iptables"; fi
+  if [ -n "$wgpkg" ]; then
+    if [ "$ASSUME_YES" = 1 ]; then
+      pkg_install $wgpkg && { INSTALLED="$INSTALLED$wgpkg"; ok "kernel wg engine available"; }
+    else
+      read -rp "Install${wgpkg} for the kernel engine? [y/N] " a
+      case "$a" in
+        [yY]*) pkg_install $wgpkg && { INSTALLED="$INSTALLED$wgpkg"; ok "kernel wg engine available"; } ;;
+        *)     warn "skipped - the wg engine will be unavailable" ;;
+      esac
+    fi
   fi
 fi
 
@@ -230,6 +317,11 @@ exec python3 "$PREFIX/nordwg.py" "\$@"
 EOF
 chmod 0755 "$BINDIR/nordwg"
 ok "installed $BINDIR/nordwg"
+
+# what we added, so --uninstall --purge knows what it may remove
+if [ -n "$INSTALLED" ]; then
+  printf '%s\n' $INSTALLED | sort -u > "$PREFIX/.installed"
+fi
 
 # ---------------------------------------------------------------- verify
 echo

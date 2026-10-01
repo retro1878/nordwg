@@ -59,7 +59,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 API = "https://api.nordvpn.com"
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 WG_PORT = 51820
 
 # Dedicated-IP servers report load 0, so a load sort surfaces them first - but they
@@ -774,6 +774,8 @@ def cmd_test(args):
     conc = max(1, min(args.concurrency, min(len(servers) or 1, 200)))
     repeat = max(1, getattr(args, "repeat", 1))
     outdir = os.path.dirname(os.path.abspath(args.out))
+    keyfile = None
+    workdir = None
     if engine == "wg":
         keyfile = "/run/nordwg.key"
         with open(keyfile, "w") as fh:
@@ -798,6 +800,11 @@ def cmd_test(args):
         stop["flag"] = True
         for w in workers:
             w.teardown()
+        # leave nothing behind, including the private key written for the wg engine
+        if workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
+        if keyfile and os.path.exists(keyfile):
+            os.remove(keyfile)
     signal.signal(signal.SIGINT, _cleanup)
     signal.signal(signal.SIGTERM, _cleanup)
 

@@ -20,7 +20,25 @@ sudo ./install.sh
 
 The installer asks for what it needs — your NordVPN access token, an optional HTTP proxy, and a
 default country — then installs `xray-core`, verifies the API is reachable, and puts a `nordwg`
-command on your PATH. Re-run it any time; `--uninstall` removes everything.
+command on your PATH. Re-run it any time.
+
+### Uninstalling
+
+```bash
+sudo ./install.sh --uninstall          # files, token, namespaces, firewall rules, key files
+sudo ./install.sh --uninstall --purge  # ...and the packages this installer added
+```
+
+`--uninstall` removes everything nordwg created: `/opt/nordwg` (and the token in it), the `nordwg`
+command, plus anything a test can leave behind when it is killed mid-run — network namespaces,
+veth pairs, the firewall rules it inserted, `/run` key files, and worker scratch under `/tmp`.
+
+It **deliberately leaves `xray-core` and `wireguard-tools` installed**, because other software on
+the host usually needs them. `--purge` removes those too, but only the ones this installer is what
+added — it records them on install.
+
+It will not delete your own `out/` results, since those are your output. It does list any it finds
+that still contain your NordLynx private key, so you can remove them yourself.
 
 Prefer to read before you run:
 
