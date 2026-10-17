@@ -1,0 +1,10 @@
+ 18:15:14 up 22:38,  5 users,  load average: 0.31, 0.13, 0.10
+               total        used        free      shared  buff/cache   available
+Mem:            1963         533         153           5        1439        1430
+SCANLEFT
+4
+  DEAD     tr87       187.40.231.x bytes=0        speed=0         2nd=000
+  DEAD     tr83       187.40.231.x bytes=0        speed=0         2nd=000
+  DEAD     tr85       187.40.231.x bytes=0        speed=0         2nd=000
+  DEAD     tr91       187.40.231.x bytes=0        speed=0         2nd=000
+  DEAD     tr89       187.40.231.x bytes=0        speed=0         2nd=000

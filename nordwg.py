@@ -59,7 +59,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 API = "https://api.nordvpn.com"
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 WG_PORT = 51820
 
 # Dedicated-IP servers report load 0, so a load sort surfaces them first - but they
@@ -177,13 +177,13 @@ def _wireguard_public_key(technologies):
 
 
 def list_servers(country_id, proxy, include_dedicated=False):
-    path = ("/v1/servers?limit=16384"
-            "&filters[country_id]=%d"
-            "&filters[servers_technologies][identifier]=wireguard_udp" % country_id)
-    servers = api_get(path, proxy=proxy, timeout=90)
+    base = "/v1/servers?limit=16384"
+    if country_id is not None:
+        base += "&filters[country_id]=%d" % country_id
+    servers = api_get(base + "&filters[servers_technologies][identifier]=wireguard_udp",
+                      proxy=proxy, timeout=90)
     if not servers:
-        servers = api_get("/v1/servers?limit=16384&filters[country_id]=%d" % country_id,
-                          proxy=proxy, timeout=90)
+        servers = api_get(base, proxy=proxy, timeout=90)
     out = []
     for s in servers:
         pub = _wireguard_public_key(s.get("technologies"))
@@ -210,11 +210,15 @@ def list_servers(country_id, proxy, include_dedicated=False):
 
 def cmd_fetch(args):
     proxy = args.proxy
-    country = resolve_country(country_arg(args), proxy)
-    log("country: %s (%s), %d servers advertised"
-        % (country["name"], country["code"], country.get("serverCount", 0)))
-    servers = list_servers(country["id"], proxy,
-                           include_dedicated=getattr(args, "include_dedicated", False))
+    inc = getattr(args, "include_dedicated", False)
+    if getattr(args, "all", False):
+        country = {"name": "All countries", "code": "all", "serverCount": 0}
+        servers = list_servers(None, proxy, include_dedicated=inc)
+    else:
+        country = resolve_country(country_arg(args), proxy)
+        log("country: %s (%s), %d servers advertised"
+            % (country["name"], country["code"], country.get("serverCount", 0)))
+        servers = list_servers(country["id"], proxy, include_dedicated=inc)
     log("wireguard-capable servers: %d%s"
         % (len(servers), " (dedicated-IP included)" if getattr(
             args, "include_dedicated", False) else " (dedicated-IP excluded)"))
@@ -915,7 +919,7 @@ def cmd_outbounds(args):
 
 
 def cmd_run(args):
-    args.country = country_arg(args)
+    args.country = "all" if getattr(args, "all", False) else country_arg(args)
     ns = argparse.Namespace(**vars(args))
     ns.out = os.path.join(args.outdir, "bundle.%s.json" % args.country.lower())
     ns.sort = args.sort
@@ -992,6 +996,7 @@ def build_parser():
 
     f = sub.add_parser("fetch", help="build bundle.json")
     f.add_argument("--country", help="name, code, or prefix (default: $NORDWG_COUNTRY)")
+    f.add_argument("--all", action="store_true", help="every WireGuard server, all countries")
     f.add_argument("--limit", type=int, default=0)
     f.add_argument("--sort", choices=["load", "name", "random"], default="load")
     f.add_argument("--include-dedicated", action="store_true",
@@ -1035,6 +1040,7 @@ def build_parser():
 
     r = sub.add_parser("run", help="fetch + test + outbounds")
     r.add_argument("--country", help="name, code, or prefix (default: $NORDWG_COUNTRY)")
+    r.add_argument("--all", action="store_true", help="every WireGuard server, all countries")
     r.add_argument("--limit", type=int, default=100)
     r.add_argument("--sort", choices=["load", "name", "random"], default="load")
     r.add_argument("--include-dedicated", action="store_true",
