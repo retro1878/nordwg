@@ -59,7 +59,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 API = "https://api.nordvpn.com"
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 WG_PORT = 51820
 
 # Dedicated-IP servers report load 0, so a load sort surfaces them first - but they
@@ -749,6 +749,18 @@ def attempt(worker, server, repeat):
     return row
 
 
+def results_payload(bundle, key, args, results):
+    return {
+        "generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "country": bundle.get("country"),
+        "private_key": key,
+        "address": args.address,
+        "port": args.port,
+        "targets": {"ping": PING_TARGET, "http": HTTP_TARGET},
+        "results": results,
+    }
+
+
 def cmd_test(args):
     engine = resolve_engine(args)
     if engine == "wg":
@@ -836,6 +848,10 @@ def cmd_test(args):
                            row["rtt_avg"] or "-", row["handshake_ms"] or "-",
                            row["loss_pct"], row["http_code"] or "-",
                            row["note"]))
+                    # flush every 25 so a long sweep leaves results on disk, not just
+                    # in memory - a killed run should not cost the whole sweep
+                    if done % 25 == 0:
+                        write_json(args.out, results_payload(bundle, key, args, results))
                     if not stop["flag"] and idx < len(queue):
                         futures[pool.submit(attempt, w, queue[idx], repeat)] = w
                         idx += 1
@@ -846,16 +862,7 @@ def cmd_test(args):
     results.sort(key=lambda r: (not r["ok"],
                                 float(r["rtt_avg"]) if r["rtt_avg"] else 1e9,
                                 r["load"]))
-    payload = {
-        "generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "country": bundle.get("country"),
-        "private_key": key,
-        "address": args.address,
-        "port": args.port,
-        "targets": {"ping": PING_TARGET, "http": HTTP_TARGET},
-        "results": results,
-    }
-    write_json(args.out, payload)
+    write_json(args.out, results_payload(bundle, key, args, results))
     write_csv(splitext(args.out)[0] + ".csv", results)
     write_working(splitext(args.out)[0] + "-working.txt", results)
     ok = [r for r in results if r["ok"]]
