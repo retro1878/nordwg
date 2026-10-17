@@ -338,7 +338,14 @@ if out="$(nordwg fetch --country "${COUNTRY:-DE}" --limit 5 --out /tmp/nordwg-ch
 else
   warn "the API check failed:"
   printf '%s\n' "$out" | sed 's/^/  /'
-  warn "if you are behind a filtering network, re-run with --proxy http://user:pass@host:port"
+  case "$out" in
+    *401*|*"access token"*)
+      warn "that is an authentication failure, not a network one: the token is wrong or expired."
+      info "generate a new one at https://my.nordaccount.com/dashboard/nordvpn/manual-configuration/"
+      info "then re-run: sudo ./install.sh -y --token '<new token>'" ;;
+    *)
+      warn "if you are behind a filtering network, re-run with --proxy http://user:pass@host:port" ;;
+  esac
 fi
 
 cat <<EOF
