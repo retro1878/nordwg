@@ -59,7 +59,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 API = "https://api.nordvpn.com"
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 WG_PORT = 51820
 
 # Dedicated-IP servers report load 0, so a load sort surfaces them first - but they
@@ -869,15 +869,23 @@ def cmd_test(args):
 # --------------------------------------------------------------------------
 
 def cmd_outbounds(args):
-    data = read_json(args.results)
+    if args.bundle:
+        data = read_json(args.bundle)
+        ok = [dict(s, _public_key=s["public_key"]) for s in data["servers"]]
+        src = args.bundle
+    else:
+        data = read_json(args.results)
+        ok = [r for r in data["results"] if r["ok"]]
+        src = args.results
     key = data.get("private_key")
+    if not key:
+        die("%s has no private_key - fetch it with a valid access token" % src)
     address = data.get("address", DEFAULT_ADDRESS)
     port = data.get("port", WG_PORT)
-    ok = [r for r in data["results"] if r["ok"]]
     if args.top:
         ok = ok[:args.top]
     if not ok:
-        die("no working servers in %s" % args.results)
+        die("nothing to emit from %s" % src)
 
     os.makedirs(args.outdir, exist_ok=True)
     conf_dir = os.path.join(args.outdir, "conf")
@@ -1032,7 +1040,9 @@ def build_parser():
     v.set_defaults(func=cmd_prove)
 
     o = sub.add_parser("outbounds", help="emit PasarGuard/Xray outbounds")
-    o.add_argument("--results", required=True)
+    src = o.add_mutually_exclusive_group(required=True)
+    src.add_argument("--results", help="results.json - only the servers that passed")
+    src.add_argument("--bundle", help="bundle.json - every server in the catalog")
     o.add_argument("--outdir", default=".")
     o.add_argument("--top", type=int, default=0)
     o.add_argument("--mtu", type=int, default=1420)
