@@ -49,12 +49,23 @@ curl -fsSL https://raw.githubusercontent.com/retro1878/nordwg/master/install.sh 
 ## Quick start
 
 ```bash
+mkdir -p out                             # --out creates it, but a log redirect dies first
 nordwg run --country DE --limit 100      # test 100 lowest-load German servers, write outbounds
 nordwg run --country CA                  # ...or with no --limit, the whole country
 nordwg prove --bundle out/bundle.ca.json --server ca1982
 ```
 
 Results and outbounds land in `./out/`.
+
+To sweep the whole catalog against one vantage point, fetch it somewhere with API access, copy it
+over, then test — detached, since it takes hours:
+
+```bash
+nordwg fetch --all --out all.json                      # on a box that can reach the API
+nohup nordwg test --bundle all.json --engine xray --repeat 2 --concurrency 6 \
+  --out out/all.json > out/all.log 2>&1 &             # mkdir -p out first
+tail -f out/all.log | grep --line-buffered ' OK '
+```
 
 ## Why this isn't a two-line script
 
