@@ -318,6 +318,11 @@ EOF
 chmod 0755 "$BINDIR/nordwg"
 ok "installed $BINDIR/nordwg"
 
+# Pre-create the output dir. A `> out/all.log` redirect is opened by the shell
+# before nordwg runs, so it fails if the directory does not exist yet.
+invoker_home="$(getent passwd "${SUDO_USER:-root}" 2>/dev/null | cut -d: -f6)"
+mkdir -p "${invoker_home:-$HOME}/out" 2>/dev/null && ok "output dir ready: ${invoker_home:-$HOME}/out"
+
 # what we added, so --uninstall --purge knows what it may remove
 if [ -n "$INSTALLED" ]; then
   printf '%s\n' $INSTALLED | sort -u > "$PREFIX/.installed"
